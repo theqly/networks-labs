@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
 #include <iostream>
@@ -9,8 +10,17 @@
 
 #define PORT 1234
 #define BUFFER_SIZE 512
-#define WAIT_TIME 2500
-#define ALIVE_TIME 1000
+#define WAIT_TIME 1500
+#define SEND_TIME 1000
+#define ALIVE_TIME 3000
+
+void print_alive(std::map<std::string, std::chrono::time_point<std::chrono::steady_clock>>& alive){
+    if(!alive.empty()) std::cout << "current programs: " << std::endl;
+
+    for(const auto& it : alive){
+        std::cout << it.first << std::endl;
+    }
+}
 
 void send_multicast(const int sock, const sockaddr_in group_addr){
     std::string message = std::to_string(getpid());
@@ -20,11 +30,10 @@ void send_multicast(const int sock, const sockaddr_in group_addr){
 }
 
 void receive_multicast(const int sock, struct pollfd* pfds, std::map<std::string, std::chrono::time_point<std::chrono::steady_clock>>& alive){
-    char buffer[BUFFER_SIZE];
+    char buffer[BUFFER_SIZE + 1];
     sockaddr_in sender_addr{};
     socklen_t sender_addr_len = sizeof(sender_addr);
 
-    auto before_poll = std::chrono::steady_clock::now();
     int num_events = poll(pfds, 1, WAIT_TIME);
 
     if(num_events == 0) {
@@ -36,33 +45,32 @@ void receive_multicast(const int sock, struct pollfd* pfds, std::map<std::string
     if(recv_len > 0){
         buffer[recv_len] = '\0';
         std::string sender = inet_ntoa(sender_addr.sin_addr);
-        alive[sender + " " + buffer] = std::chrono::steady_clock::now();
+
+        if(!alive.count(sender + " " + buffer)) {
+            alive[sender + " " + buffer] = std::chrono::steady_clock::now();
+            print_alive(alive);
+        } else alive[sender + " " + buffer] = std::chrono::steady_clock::now();
+
     } else if(recv_len == -1){
         perror("error in recvfrom()");
     }
-    auto timeout = std::chrono::duration_cast<std::chrono::milliseconds >(before_poll - std::chrono::steady_clock::now());
-    if(timeout.count() < WAIT_TIME) std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_TIME - timeout.count()));
+
 }
 
 void cleanup(std::map<std::string, std::chrono::time_point<std::chrono::steady_clock>>& alive){
-    auto now = std::chrono::steady_clock::now();
     for (auto it = alive.begin(); it != alive.end(); ) {
-        auto timeout = std::chrono::duration_cast<std::chrono::seconds>(now - it->second);
+        auto now = std::chrono::steady_clock::now();
+        auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second);
         if (timeout.count() >= ALIVE_TIME) {
             it = alive.erase(it);
+            print_alive(alive);
         } else {
             ++it;
         }
     }
 }
 
-void print_alive(std::map<std::string, std::chrono::time_point<std::chrono::steady_clock>>& alive){
-    if(!alive.empty()) std::cout << "current programs: " << std::endl;
 
-    for(const auto& it : alive){
-        std::cout << it.first << std::endl;
-    }
-}
 
 int main(int argc, char* argv[]) {
     if(argc != 2){
@@ -125,14 +133,23 @@ int main(int argc, char* argv[]) {
 
     std::map<std::string, std::chrono::time_point<std::chrono::steady_clock>> alive;
 
+    auto prev = std::chrono::steady_clock::now();
+
+
     while(true){
         receive_multicast(recv_sock,pfds, alive);
 
-        send_multicast(send_sock, group_addr);
+        auto now = std::chrono::steady_clock::now();
+        auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev);
 
-        print_alive(alive);
+        if(timeout.count() >= SEND_TIME) {
+            send_multicast(send_sock, group_addr);
+            prev = now;
+        }
 
         cleanup(alive);
+
+        //print_alive(alive);
     }
 
     return 0;
