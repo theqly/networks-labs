@@ -37,6 +37,14 @@ public:
     }
 
     void send_file(const std::string& file_path) {
+
+        // PROTOCOL:
+        // 1. send filename len
+        // 2. send filename
+        // 3. send size of file
+        // 4. send (size of file) bytes of file
+        // 5. recv response that all (size of file) are received
+
         std::ifstream file(file_path, std::ios::binary);
 
         if(!file.is_open()) {
@@ -47,42 +55,26 @@ public:
         const uint64_t file_size = file.tellg();
         file.seekg(0, std::ios::beg);
 
-        const char* filename = strrchr(file_path.c_str(), '/');
-        if(filename == nullptr) filename = file_path.c_str();
-        else filename++;
+        const uint16_t file_path_len = htons(file_path.size());
 
         std::cout << "opened a file and trying to send" << std::endl;
 
-        // PROTOCOL:
-        // 1. send filename
-        // 2. recv response that filename received
+        if(send(sock, &file_path_len, sizeof(file_path_len), 0) == -1) {
+            throw std::runtime_error("error in send(file path len)");
+        }
 
-        // 3. send size of file
-        // 4. recv response that size of received
+        std::cout << "sent a file path len: " << file_path_len << std::endl;
 
-        // 5. send (size of file) bytes of file
-        // 6. recv response that all (size of file) are received
-
-        char response[128];
-
-        if(send(sock, filename, strlen(filename) + 1, 0) == -1) {
+        if(send(sock, file_path.c_str(), file_path.size(), 0) == -1) {
             throw std::runtime_error("error in send(filename)");
         }
 
-        if(recv(sock, response, sizeof(response), 0) == -1) {
-            throw std::runtime_error("error in recv()");
-        }
-
-        std::cout << "sent a filename: " << filename << std::endl;
+        std::cout << "sent a file path: " << file_path << std::endl;
 
         const uint64_t n_file_size = htonll(file_size);
 
         if(send(sock, &n_file_size, sizeof(n_file_size), 0) == -1) {
             throw std::runtime_error("error in send(file size)");
-        }
-
-        if(recv(sock, response, sizeof(response), 0) == -1) {
-            throw std::runtime_error("error in recv()");
         }
 
         std::cout << "sent a file size: " << file_size << std::endl;
@@ -108,6 +100,8 @@ public:
         std::cout << "after cycle" << std::endl;
 
         file.close();
+
+        char response[128];
 
         if(recv(sock, response, sizeof(response), 0) == -1){
             throw std::runtime_error("error in recv()");
