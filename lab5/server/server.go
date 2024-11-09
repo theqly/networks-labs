@@ -3,19 +3,22 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
+	"log"
 	"net"
+	"sync"
 )
 
 func handshake(conn net.Conn) bool {
 	buf := make([]byte, 2)
 	_, err := conn.Read(buf)
 	if err != nil {
-		fmt.Println("error with reading from: " + conn.RemoteAddr().String())
+		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 		return true
 	}
 
-	if buf[0] != 0x55 {
-		fmt.Println("accepting ONLY socks5 connections")
+	if buf[0] != 0x05 {
+		log.Printf("Accepting ONLY SOCKS5 connections, got: %x", buf[0])
 		return true
 	}
 
@@ -23,102 +26,150 @@ func handshake(conn net.Conn) bool {
 	methods := make([]byte, nMethods)
 	_, err = conn.Read(methods)
 	if err != nil {
-		fmt.Println("error with reading from: " + conn.RemoteAddr().String())
+		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 		return true
 	}
 
-	_, err = conn.Write([]byte{0x55, 0x00})
+	_, err = conn.Write([]byte{0x05, 0x00})
 	if err != nil {
-		fmt.Println("error with writing to: " + conn.RemoteAddr().String())
+		log.Printf("Error writing to %s: %v", conn.RemoteAddr().String(), err)
 		return true
 	}
 
-	fmt.Println("successfully handshake")
+	log.Printf("Handshake successful with client %s", conn.RemoteAddr().String())
 	return false
 }
 
 func connect(conn net.Conn) net.Conn {
-
 	buf := make([]byte, 4)
 	_, err := conn.Read(buf)
 	if err != nil {
-		fmt.Println("error with reading from: " + conn.RemoteAddr().String())
+		connected_send(conn, 0x01)
+		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 		return nil
 	}
 
-	if buf[0] != 0x55 || buf[1] != 0x00 {
-		fmt.Println("accepting ONLY socks5 connections without authentication")
+	if buf[0] != 0x05 {
+		connected_send(conn, 0x07)
+		log.Printf("Accepting ONLY SOCKS5 connections, got: %x", buf[0])
+		return nil
+	}
+
+	if buf[1] != 0x01 {
+		connected_send(conn, 0x07)
+		log.Printf("Unknown command: %x", buf[1])
 		return nil
 	}
 
 	var address string
-
 	switch buf[3] {
 	case 0x01:
-		tmp_addr := make([]byte, 4)
-		_, err := conn.Read(tmp_addr)
+		tmpAddr := make([]byte, 4)
+		_, err := conn.Read(tmpAddr)
 		if err != nil {
-			fmt.Println("error with reading from: " + conn.RemoteAddr().String())
+			connected_send(conn, 0x01)
+			log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 			return nil
 		}
-
-		address = net.IP(tmp_addr).String()
+		address = net.IP(tmpAddr).String()
 	case 0x03:
-		len := make([]byte, 1)
-		_, err := conn.Read(len)
+		lenBuf := make([]byte, 1)
+		_, err := conn.Read(lenBuf)
 		if err != nil {
-			fmt.Println("error with reading from: " + conn.RemoteAddr().String())
+			connected_send(conn, 0x01)
+			log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 			return nil
 		}
-
-		domain := make([]byte, len[0])
+		domain := make([]byte, lenBuf[0])
 		_, err = conn.Read(domain)
 		if err != nil {
-			fmt.Println("error with reading from: " + conn.RemoteAddr().String())
+			connected_send(conn, 0x01)
+			log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 			return nil
 		}
-
 		address = string(domain)
 	default:
-		fmt.Println("unsupported socks5 address type")
+		connected_send(conn, 0x08)
+		log.Printf("Unsupported SOCKS5 address type: %x", buf[3])
 		return nil
 	}
 
-	buf = make([]byte, 2)
-	_, err = conn.Read(buf)
+	portBuf := make([]byte, 2)
+	_, err = conn.Read(portBuf)
 	if err != nil {
-		fmt.Println("error with reading from: " + conn.RemoteAddr().String())
+		connected_send(conn, 0x01)
+		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 		return nil
 	}
 
-	port := binary.BigEndian.Uint16(buf)
+	port := binary.BigEndian.Uint16(portBuf)
 	address = fmt.Sprintf("%s:%d", address, port)
 
-	target_conn, err := net.Dial("tcp", address)
+	targetConn, err := net.Dial("tcp", address)
 	if err != nil {
-		fmt.Println("error with connecting to " + address)
-		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		log.Printf("Error connecting to %s: %v", address, err)
+		connected_send(conn, 0x01)
 		return nil
 	}
 
-	return target_conn
+	connected_send(conn, 0x00)
+	log.Printf("Successfully connected to %s", address)
+	return targetConn
 }
 
-func handle_client(conn net.Conn) {
+func connected_send(conn net.Conn, err_code byte) {
+	_, err := conn.Write([]byte{0x05, err_code, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	if err != nil {
+		log.Printf("Error writing to %s: %v", conn.RemoteAddr().String(), err)
+		return
+	}
+}
+
+func transferData(conn net.Conn, target_conn net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		defer target_conn.(*net.TCPConn).CloseWrite()
+
+		_, err := io.Copy(target_conn, conn)
+		if err != nil {
+			log.Printf("Error transferring data from %s: %v", conn.RemoteAddr().String(), err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		defer conn.(*net.TCPConn).CloseWrite()
+
+		_, err := io.Copy(conn, target_conn)
+		if err != nil {
+			log.Printf("Error transferring data to %s: %v", conn.RemoteAddr().String(), err)
+		}
+	}()
+
+	wg.Wait()
+}
+
+func handleClient(conn net.Conn) {
 	defer conn.Close()
 
-	fmt.Println("new connection from: ", conn.RemoteAddr())
+	log.Printf("New connection from %s", conn.RemoteAddr().String())
 
-	if handshake(conn) != false {
-		fmt.Println("handshake failed")
+	if handshake(conn) {
+		log.Println("Handshake failed")
 		return
 	}
 
-	if target_conn := connect(conn); target_conn == nil {
-		fmt.Println("target connection failed")
+	targetConn := connect(conn)
+	if targetConn == nil {
+		log.Println("Target connection failed")
 		return
 	}
+	defer targetConn.Close()
 
+	transferData(conn, targetConn)
 }
 
 func main() {
@@ -126,20 +177,19 @@ func main() {
 
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		fmt.Println("error with opening port " + port)
+		log.Printf("Error opening port %s: %v", port, err)
 		return
 	}
-
 	defer listener.Close()
-	fmt.Println("Listening on port " + port)
+	log.Printf("Listening on port %s", port)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("error with accepting connection " + port)
+			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
 
-		go handle_client(conn)
+		go handleClient(conn)
 	}
 }
