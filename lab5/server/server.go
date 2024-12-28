@@ -11,7 +11,7 @@ import (
 
 func handshake(conn net.Conn) bool {
 	buf := make([]byte, 2)
-	_, err := conn.Read(buf)
+	_, err := io.ReadFull(conn, buf)
 	if err != nil {
 		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 		return true
@@ -24,7 +24,7 @@ func handshake(conn net.Conn) bool {
 
 	nMethods := int(buf[1])
 	methods := make([]byte, nMethods)
-	_, err = conn.Read(methods)
+	_, err = io.ReadFull(conn, methods)
 	if err != nil {
 		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
 		return true
@@ -42,7 +42,7 @@ func handshake(conn net.Conn) bool {
 
 func connect(conn net.Conn) net.Conn {
 	buf := make([]byte, 4)
-	_, err := conn.Read(buf)
+	_, err := io.ReadFull(conn, buf)
 	if err != nil {
 		connected_send(conn, 0x01)
 		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
@@ -81,7 +81,7 @@ func connect(conn net.Conn) net.Conn {
 			return nil
 		}
 		domain := make([]byte, lenBuf[0])
-		_, err = conn.Read(domain)
+		_, err = io.ReadFull(conn, domain)
 		if err != nil {
 			connected_send(conn, 0x01)
 			log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
@@ -95,7 +95,7 @@ func connect(conn net.Conn) net.Conn {
 	}
 
 	portBuf := make([]byte, 2)
-	_, err = conn.Read(portBuf)
+	_, err = io.ReadFull(conn, portBuf)
 	if err != nil {
 		connected_send(conn, 0x01)
 		log.Printf("Error reading from %s: %v", conn.RemoteAddr().String(), err)
