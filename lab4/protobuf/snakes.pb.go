@@ -4,7 +4,7 @@
 // 	protoc        v3.12.4
 // source: snakes.proto
 
-package proto
+package protobuf
 
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
