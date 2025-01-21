@@ -3,6 +3,7 @@ package game
 import (
 	"fmt"
 	"google.golang.org/protobuf/proto"
+	"log"
 	"math/rand"
 	"snake_game/protobuf"
 	"sync"
@@ -13,42 +14,11 @@ type Game struct {
 	lock  *sync.Mutex
 }
 
-func NewGame(config *protobuf.GameConfig, lock *sync.Mutex) *Game {
+func NewGame(config *protobuf.GameConfig) *Game {
 	return &Game{
 		field: NewField(config),
-		lock:  lock,
+		lock:  new(sync.Mutex),
 	}
-}
-
-func EditFieldFromState(field *Field, stateMsg *protobuf.GameMessage_StateMsg) {
-	if field == nil || stateMsg == nil {
-		return
-	}
-
-	field.SetFoods(nil)
-	var foods []*protobuf.GameState_Coord
-	for _, food := range stateMsg.GetState().GetFoods() {
-		foods = append(foods, food)
-	}
-	field.SetFoods(foods)
-
-	fmt.Printf("[Game] field edit, cur snakes count %d, new snakes count %d\n", len(field.Snakes()), len(stateMsg.GetState().GetSnakes()))
-
-	for _, snake := range field.Snakes() {
-		snake.ClearUpdated()
-	}
-
-	for _, snakeProto := range stateMsg.GetState().GetSnakes() {
-		field.UpdateSnake(ParseSnake(snakeProto, field.Height(), field.Width()))
-	}
-
-	var remainingSnakes []*Snake
-	for _, snake := range field.Snakes() {
-		if snake.IsUpdated() {
-			remainingSnakes = append(remainingSnakes, snake)
-		}
-	}
-	field.SetSnakes(remainingSnakes)
 }
 
 func (g *Game) Update() {
@@ -60,7 +30,7 @@ func (g *Game) Update() {
 		if g.field.HasPlace() {
 			g.PlaceFood()
 		} else {
-			fmt.Println("[Game] place for food not found")
+			fmt.Println("[game] place for food not found")
 			break
 		}
 	}
@@ -81,7 +51,7 @@ func (g *Game) Update() {
 	}
 
 	for _, snakeToRemove := range snakesToRemove {
-		g.field.RemoveSnake(snakeToRemove)
+		g.field.RemoveSnake(snakeToRemove.playerID)
 	}
 
 	snakesToRemove = nil
@@ -90,12 +60,12 @@ func (g *Game) Update() {
 			if otherSnake == snake {
 				continue
 			}
-			if otherSnake.Head().X == snake.Head().X && otherSnake.Head().Y == snake.Head().Y {
+			if otherSnake.Head().GetX() == snake.Head().GetX() && otherSnake.Head().GetY() == snake.Head().GetY() {
 				snakesToRemove = append(snakesToRemove, snake, otherSnake)
 				continue
 			}
 			for _, part := range otherSnake.Body() {
-				if part.X == snake.Head().X && part.Y == snake.Head().Y {
+				if part.GetX() == snake.Head().GetX() && part.GetY() == snake.Head().GetY() {
 					otherSnake.AddScore(1)
 					snakesToRemove = append(snakesToRemove, snake)
 					break
@@ -105,7 +75,7 @@ func (g *Game) Update() {
 	}
 
 	for _, snakeToRemove := range snakesToRemove {
-		g.field.RemoveSnake(snakeToRemove)
+		g.field.RemoveSnake(snakeToRemove.playerID)
 	}
 }
 
@@ -116,7 +86,7 @@ func (g *Game) UpdateSnakeDirection(playerID int, newDirection protobuf.Directio
 			return
 		}
 	}
-	fmt.Printf("[Game] direction update: PlayerID %d not found", playerID)
+	log.Printf("[game] direction update: player %d not found", playerID)
 }
 
 func (g *Game) PlaceFood() {
@@ -137,10 +107,24 @@ func (g *Game) PlaceFood() {
 	}
 }
 
-func (g *Game) AddSnake(snake *Snake) {
-	g.field.AddSnake(snake)
+func (g *Game) AddSnake(playerId int) error {
+	err := g.field.AddNewSnake(playerId)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (g *Game) RemoveSnake(playerId int) {
+	g.field.RemoveSnake(playerId)
 }
 
 func (g *Game) Field() *Field {
+	g.lock.Lock()
+	defer g.lock.Unlock()
 	return g.field
+}
+
+func (g *Game) Lock() *sync.Mutex {
+	return g.lock
 }

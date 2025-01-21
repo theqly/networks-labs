@@ -1,6 +1,7 @@
 package game
 
 import (
+	"fmt"
 	"google.golang.org/protobuf/proto"
 	"log"
 	"math/rand"
@@ -10,14 +11,14 @@ import (
 
 const (
 	squareSize        = 5
-	maxAttemptsToFind = 100000
+	maxAttemptsToFind = 100
 )
 
 type Field struct {
 	config *protobuf.GameConfig
 	snakes []*Snake
 	foods  []*protobuf.GameState_Coord
-	lock   sync.Mutex
+	lock   *sync.Mutex
 }
 
 func NewField(config *protobuf.GameConfig) *Field {
@@ -25,11 +26,46 @@ func NewField(config *protobuf.GameConfig) *Field {
 		config: config,
 		snakes: []*Snake{},
 		foods:  []*protobuf.GameState_Coord{},
+		lock:   new(sync.Mutex),
 	}
 }
 
-func (f *Field) FindValidSnakePosition(initialPosition *[]*protobuf.GameState_Coord) protobuf.Direction {
-	rand.Seed(rand.Int63())
+func (f *Field) EditFieldFromState(state *protobuf.GameState) {
+	if state == nil {
+		return
+	}
+
+	f.SetFoods(nil)
+	var foods []*protobuf.GameState_Coord
+	for _, food := range state.GetFoods() {
+		foods = append(foods, food)
+	}
+	f.SetFoods(foods)
+
+	for _, snake := range f.Snakes() {
+		snake.ClearUpdated()
+	}
+
+	for _, snakeProto := range state.GetSnakes() {
+		f.UpdateSnake(ParseSnake(snakeProto, f.Width(), f.Height()))
+	}
+
+	var remainingSnakes []*Snake
+	for _, snake := range f.Snakes() {
+		if snake.IsUpdated() {
+			remainingSnakes = append(remainingSnakes, snake)
+		}
+		for _, player := range state.Players.GetPlayers() {
+			if snake.PlayerID() == int(player.GetId()) {
+				snake.SetScore(int(player.GetScore()))
+			}
+		}
+	}
+
+	f.SetSnakes(remainingSnakes)
+}
+
+func (f *Field) findValidSnakePosition(initialPosition *[]*protobuf.GameState_Coord) (protobuf.Direction, error) {
 
 	for attempt := 0; attempt < maxAttemptsToFind; attempt++ {
 		centerX := rand.Intn(f.Width())
@@ -78,12 +114,12 @@ func (f *Field) FindValidSnakePosition(initialPosition *[]*protobuf.GameState_Co
 
 		if !f.IsCellOccupied(head) && !f.IsCellOccupied(tail) {
 			*initialPosition = append(*initialPosition, head, tail)
-			return headDirection
+			return headDirection, nil
 		}
 
 	}
 
-	panic("no space available for snake")
+	return 0, fmt.Errorf("no space for snake")
 }
 
 func (f *Field) IsCellOccupied(cell *protobuf.GameState_Coord) bool {
@@ -96,7 +132,7 @@ func (f *Field) IsCellOccupied(cell *protobuf.GameState_Coord) bool {
 		}
 	}
 	for _, food := range f.foods {
-		if food.X == cell.X && food.Y == cell.Y {
+		if food.GetX() == cell.GetX() && food.GetY() == cell.GetY() {
 			return true
 		}
 	}
@@ -108,7 +144,7 @@ func (f *Field) ContainsFood(cell *protobuf.GameState_Coord) bool {
 	defer f.lock.Unlock()
 
 	for _, food := range f.foods {
-		if food.X == cell.X && food.Y == cell.Y {
+		if food.GetX() == cell.GetX() && food.GetY() == cell.GetY() {
 			return true
 		}
 	}
@@ -116,9 +152,6 @@ func (f *Field) ContainsFood(cell *protobuf.GameState_Coord) bool {
 }
 
 func (f *Field) UpdateSnake(snake *Snake) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-
 	for _, snk := range f.snakes {
 		if snk.PlayerID() == snake.PlayerID() {
 			snk.SetBody(snake.Body())
@@ -147,16 +180,46 @@ func (f *Field) AddSnake(snake *Snake) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	f.snakes = append(f.snakes, snake)
-	log.Printf("[Field] field count snakes: %d\n", len(f.snakes))
 }
 
-func (f *Field) RemoveSnake(snake *Snake) {
+func (f *Field) AddNewSnake(playerId int) error {
+
+	initialPosition := make([]*protobuf.GameState_Coord, 0)
+	headDirection, err := f.findValidSnakePosition(&initialPosition)
+	if err != nil {
+		log.Printf("[field] cannot add snake: %s", err.Error())
+		return err
+	}
+
+	snake := NewSnake(initialPosition, playerId)
+	snake.SetHeadDirection(headDirection)
+	snake.SetNextDirection(headDirection)
+
+	f.lock.Lock()
+	f.snakes = append(f.snakes, snake)
+	f.lock.Unlock()
+
+	return nil
+}
+
+func (f *Field) RemoveSnake(playerId int) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
-	rand.Seed(rand.Int63())
+	var snake *Snake
+	for _, s := range f.snakes {
+		if s.PlayerID() == playerId {
+			snake = s
+		}
+	}
+
+	if snake == nil {
+		log.Printf("[field] snake with id %d doesnt exists", playerId)
+		return
+	}
+
 	for _, body := range snake.Body() {
-		if body.X == snake.Head().X && body.Y == snake.Head().Y {
+		if body.GetX() == snake.Head().GetX() && body.GetY() == snake.Head().GetY() {
 			continue
 		}
 		if rand.Intn(100) < 50 {
@@ -198,6 +261,10 @@ func (f *Field) AmountOfFoodNeeded(playerCount int) int {
 	return playerCount + f.FoodStatic()
 }
 
+func (f *Field) GameConfig() *protobuf.GameConfig {
+	return f.config
+}
+
 func (f *Field) Width() int {
 	return int(*f.config.Width)
 }
@@ -224,4 +291,19 @@ func (f *Field) Snakes() []*Snake {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	return f.snakes
+}
+
+func (f *Field) SnakeById(playerId int) *Snake {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for _, snake := range f.snakes {
+		if playerId == snake.playerID {
+			return snake
+		}
+	}
+	return nil
+}
+
+func (f *Field) Lock() *sync.Mutex {
+	return f.lock
 }

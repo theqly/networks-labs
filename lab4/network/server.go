@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"fmt"
 	"google.golang.org/protobuf/proto"
 	"log"
@@ -13,41 +14,30 @@ import (
 )
 
 const (
-	MulticastAddress = "239.192.0.4"
-	MulticastPort    = 9192
+	maxPlayersCount = 10
 )
 
 type Server struct {
-	sendConfig       SendConfig
-	serverConn       *net.UDPConn
-	players          []*protobuf.GamePlayer
-	lockGame         sync.Mutex
-	game             *game.Game
-	incomingMessages chan *protobuf.GameMessage
-	sentMessages     map[int64]*MessageInfo
-	msgSeq           int64
+	gameName   string
+	masterId   int
+	deputyId   int
+	serverAddr *net.UDPAddr
+	serverConn *net.UDPConn
+	lockServer *sync.Mutex
+	players    []*protobuf.GamePlayer
+	lastPing   map[int]time.Time
+	lockGame   *sync.Mutex
+	game       *game.Game
+	msgSeq     int64
+	uniqueId   int
+	stateId    int
+	cancel     context.CancelFunc
+	gameDelay  time.Duration
+	pingDelay  time.Duration
+	waitDelay  time.Duration
 }
 
-type SendConfig struct {
-	announcementDelay time.Duration
-	pingDelay         time.Duration
-	waitDelay         time.Duration
-}
-
-type MessageInfo struct {
-	Timestamp    time.Time
-	AttemptCount int
-	Message      *protobuf.GameMessage
-	Address      *net.UDPAddr
-}
-
-func NewServer(width int, height int, foodStatic int, delayMS int) *Server {
-	sendConf := SendConfig{
-		announcementDelay: 100,
-		pingDelay:         100,
-		waitDelay:         1000,
-	}
-
+func NewServer(gameName string, width int, height int, foodStatic int, delayMS int) *Server {
 	gameConf := protobuf.GameConfig{
 		Width:        proto.Int32(int32(width)),
 		Height:       proto.Int32(int32(height)),
@@ -55,50 +45,47 @@ func NewServer(width int, height int, foodStatic int, delayMS int) *Server {
 		StateDelayMs: proto.Int32(int32(delayMS)),
 	}
 
-	lock := new(sync.Mutex)
-
-	g := game.NewGame(&gameConf, lock)
+	g := game.NewGame(&gameConf)
 
 	return &Server{
-		sendConfig: sendConf,
+		gameName:   gameName,
+		masterId:   0,
+		deputyId:   -1,
+		lockServer: new(sync.Mutex),
 		game:       g,
-		lockGame:   *lock,
+		lockGame:   g.Lock(),
+		lastPing:   make(map[int]time.Time),
+		msgSeq:     0,
+		uniqueId:   0,
+		stateId:    0,
+		gameDelay:  time.Duration(delayMS),
+		pingDelay:  time.Duration(float64(delayMS) * 0.1),
+		waitDelay:  time.Duration(float64(delayMS) * 0.8),
 	}
 }
 
-func (s *Server) Start(playerName string) error {
-	serverAdrr, err := s.getInterfaceAddress("eth0")
+func (s *Server) Start() error {
+	serverAddr, err := s.getInterfaceAddress("eth0")
 	if err != nil {
-		log.Printf("failed to get eth0 address: %v", err)
+		log.Printf("[server] failed to get eth0 address: %v", err)
 		return err
 	}
 
-	serverAdrr.Port = 0
-	serverConn, err := net.ListenUDP("udp", serverAdrr)
+	serverConn, err := net.ListenUDP("udp", serverAddr)
 	if err != nil {
-		log.Printf("failed to start server: %v", err)
+		log.Printf("[server] failed to start server: %v", err)
 		return err
 	}
-
-	s.serverConn = serverConn
-	s.incomingMessages = make(chan *protobuf.GameMessage, 100)
-	s.players = make([]*protobuf.GamePlayer, 0)
 
 	localAddr := serverConn.LocalAddr().(*net.UDPAddr)
-	serverPort := localAddr.Port
-	s.addNewPlayer(playerName, serverAdrr.IP.String(), serverPort, protobuf.NodeRole_MASTER.Enum())
 
-	var initialPosition []*protobuf.GameState_Coord
-	headDirection := s.game.Field().FindValidSnakePosition(&initialPosition)
-
-	playerId := *s.players[0].Id
-	newSnake := game.NewSnake(initialPosition, int(playerId))
-	newSnake.SetHeadDirection(headDirection)
-	newSnake.SetNextDirection(headDirection)
-
-	s.game.AddSnake(newSnake)
+	s.serverAddr = localAddr
+	s.serverConn = serverConn
+	s.players = make([]*protobuf.GamePlayer, 0)
 
 	s.startThreads()
+
+	log.Printf("[server] server started on %s:%d", s.serverAddr.IP.String(), s.serverAddr.Port)
 
 	return nil
 }
@@ -132,52 +119,233 @@ func (s *Server) getInterfaceAddress(interfaceName string) (*net.UDPAddr, error)
 }
 
 func (s *Server) startThreads() {
-	go s.announcementSendThread()
-	go s.gameLoop()
-	go s.listenForMessages()
+
+	ctx, canc := context.WithCancel(context.Background())
+	s.cancel = canc
+
+	s.startAnnouncementSendThread(ctx)
+	s.startListenerThread(ctx)
+	s.startGameLoopThread(ctx)
+	s.startPingCheckerThread(ctx)
 }
 
-func (s *Server) listenForMessages() {
-	buffer := make([]byte, 4096)
-	for {
-		n, addr, err := s.serverConn.ReadFromUDP(buffer)
-		if err != nil {
-			log.Printf("[Server] Error reading from UDP: %v", err)
-			continue
-		}
+func (s *Server) startAnnouncementSendThread(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				announcementMsg := s.createAnnouncementMessage()
 
-		var msg protobuf.GameMessage
-		err = proto.Unmarshal(buffer[:n], &msg)
-		if err != nil {
-			log.Printf("[Server] Failed to unmarshal message: %v", err)
-			continue
-		}
+				err := s.sendGameMessage(announcementMsg, MulticastAddress, MulticastPort)
+				if err != nil {
+					log.Printf("[server] announcement send error: %v", err)
+					break
+				}
 
-		s.handleIncomingMessage(&msg, addr)
-	}
+				log.Printf("[server] sent announcement message, players count: %d", len(s.players))
+
+				time.Sleep(AnnouncementDelay * time.Millisecond)
+			}
+		}
+	}()
+}
+
+func (s *Server) startListenerThread(ctx context.Context) {
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				n, addr, err := s.serverConn.ReadFromUDP(buffer)
+				if err != nil {
+					log.Printf("[server] Error reading from UDP: %v", err)
+					continue
+				}
+
+				var msg protobuf.GameMessage
+				err = proto.Unmarshal(buffer[:n], &msg)
+				if err != nil {
+					log.Printf("[server] Failed to unmarshal message: %v", err)
+					continue
+				}
+
+				s.handleIncomingMessage(&msg, addr)
+			}
+		}
+	}()
+}
+
+func (s *Server) startGameLoopThread(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				time.Sleep(s.gameDelay * time.Millisecond)
+
+				s.game.Update()
+
+				s.updateDeputyId()
+				s.updatePlayersScore()
+				err := s.sendStateForAll()
+				if err != nil {
+					log.Printf("[server] Game loop destroyed: %v", err)
+					break
+				}
+			}
+		}
+	}()
+}
+
+func (s *Server) startPingCheckerThread(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				time.Sleep(s.pingDelay * time.Millisecond)
+				s.sendPings()
+				s.lockServer.Lock()
+				now := time.Now()
+
+				for _, player := range s.players {
+					playerId := int(*player.Id)
+					if now.Sub(s.lastPing[playerId]) > s.waitDelay*time.Millisecond {
+						log.Printf("[server] player %d doesnt active, removing (last ping %s, now %s)", playerId, s.lastPing[playerId], now)
+						s.removePlayerWithoutSnake(playerId)
+					}
+				}
+
+				s.lockServer.Unlock()
+			}
+		}
+	}()
 }
 
 func (s *Server) handleIncomingMessage(msg *protobuf.GameMessage, addr *net.UDPAddr) {
 	switch t := msg.Type.(type) {
 	case *protobuf.GameMessage_Join:
-		s.handleJoinMessage(t.Join, addr)
+		s.handleJoinMessage(*msg.MsgSeq, t.Join, addr)
+	case *protobuf.GameMessage_Ack:
 	case *protobuf.GameMessage_Ping:
-		//TODO: Handle Ping
+		s.handlePing(addr)
 	case *protobuf.GameMessage_Steer:
-		//TODO: Handle Steer
+		s.handleSteer(*msg.GetSteer().Direction, addr)
+	case *protobuf.GameMessage_RoleChange:
+		s.handleRoleChange(msg, addr)
 	case *protobuf.GameMessage_Error:
-		log.Printf("[Server] Error received: %v", t.Error.ErrorMessage)
+		log.Printf("[server] error received: %v", t.Error.ErrorMessage)
 	default:
-		log.Printf("[Server] Unknown message type received")
+		log.Printf("[server] Unknown message type received")
 	}
 }
 
-func (s *Server) handleJoinMessage(join *protobuf.GameMessage_JoinMsg, addr *net.UDPAddr) {
-	s.addNewPlayer(join.GetPlayerName(), addr.IP.String(), addr.Port, join.GetRequestedRole().Enum())
-	log.Printf("[Server] Player %s joined the game", join.GetPlayerName())
+func (s *Server) handleJoinMessage(msgSeq int64, join *protobuf.GameMessage_JoinMsg, addr *net.UDPAddr) {
+
+	log.Printf("[server] join message received from %s:%d", addr.IP.String(), addr.Port)
+
+	if len(s.players) > maxPlayersCount {
+		log.Printf("[server] max players reached")
+		s.sendError("max players count reached", addr)
+		return
+	}
+
+	playerId := s.addNewPlayer(join.GetPlayerName(), addr.IP.String(), addr.Port, join.GetRequestedRole().Enum())
+
+	if join.GetRequestedRole() == protobuf.NodeRole_VIEWER {
+		s.sendAcknowledgeMessage(int32(playerId), msgSeq, addr)
+		log.Printf("[server] viewer joined the game")
+		return
+	}
+
+	err := s.game.AddSnake(playerId)
+	if err != nil {
+		s.removePlayer(playerId)
+		log.Printf("[server] failed to add snake: %v", err)
+		s.sendError("no space for snake", addr)
+		return
+	}
+
+	s.sendAcknowledgeMessage(int32(playerId), msgSeq, addr)
+
+	s.lastPing[playerId] = time.Now()
+
+	log.Printf("[server] player %s joined the game", join.GetPlayerName())
 }
 
-func (s *Server) sendError(errorMessage string, addr *net.UDPAddr) {
+func (s *Server) handlePing(addr *net.UDPAddr) {
+	playerId := s.getIdByAddr(addr)
+
+	s.lockServer.Lock()
+	s.lastPing[playerId] = time.Now()
+	s.lockServer.Unlock()
+}
+
+func (s *Server) handleSteer(direction protobuf.Direction, addr *net.UDPAddr) {
+	playerId := s.getIdByAddr(addr)
+
+	if playerId == -1 {
+		log.Printf("[server] failed to find player with addr %s:%d", addr.IP.String(), addr.Port)
+		return
+	}
+
+	s.game.UpdateSnakeDirection(playerId, direction)
+
+	s.lastPing[playerId] = time.Now()
+	log.Printf("[server] received steer from %s:%d", addr.IP.String(), addr.Port)
+}
+
+func (s *Server) handleRoleChange(msg *protobuf.GameMessage, addr *net.UDPAddr) {
+	roleChangeMsg := msg.GetRoleChange()
+
+	senderRole := roleChangeMsg.GetSenderRole()
+	//receiverRole := roleChangeMsg.GetReceiverRole()
+
+	if senderRole == protobuf.NodeRole_VIEWER {
+		s.makePlayerViewer(int(msg.GetSenderId()))
+	}
+
+	s.sendAcknowledgeMessage(msg.GetSenderId(), msg.GetMsgSeq(), addr)
+}
+
+func (s *Server) sendAcknowledgeMessage(playerId int32, msgSeq int64, addr *net.UDPAddr) error {
+	ackMsg := &protobuf.GameMessage{
+		MsgSeq:     proto.Int64(msgSeq),
+		SenderId:   proto.Int32(int32(s.masterId)),
+		ReceiverId: proto.Int32(playerId),
+		Type: &protobuf.GameMessage_Ack{
+			Ack: &protobuf.GameMessage_AckMsg{},
+		},
+	}
+
+	err := s.sendGameMessage(ackMsg, addr.IP.String(), addr.Port)
+	return err
+}
+
+func (s *Server) sendPings() error {
+	s.lockServer.Lock()
+	defer s.lockServer.Unlock()
+	seq := s.incrementMsgSeq()
+
+	pingMsg := &protobuf.GameMessage{
+		MsgSeq: &seq,
+		Type:   &protobuf.GameMessage_Ping{Ping: &protobuf.GameMessage_PingMsg{}},
+	}
+
+	for _, player := range s.players {
+		s.sendGameMessage(pingMsg, player.GetIpAddress(), int(player.GetPort()))
+	}
+
+	return nil
+}
+
+func (s *Server) sendError(errorMessage string, addr *net.UDPAddr) error {
 	errMsg := &protobuf.GameMessage{
 		MsgSeq: proto.Int64(s.incrementMsgSeq()),
 		Type: &protobuf.GameMessage_Error{
@@ -186,45 +354,30 @@ func (s *Server) sendError(errorMessage string, addr *net.UDPAddr) {
 			},
 		},
 	}
-	s.sendGameMessage(errMsg, addr.IP.String(), addr.Port)
+	err := s.sendGameMessage(errMsg, addr.IP.String(), addr.Port)
+	return err
 }
 
-func (s *Server) announcementSendThread() {
-	for {
-		announcementMsg := s.createAnnouncementMessage()
-
-		err := s.sendGameMessage(announcementMsg, MulticastAddress, MulticastPort)
-		if err != nil {
-			log.Printf("[Server] Announcement send error: %v", err)
-			break
-		}
-
-		log.Printf("sent announcement message")
-
-		time.Sleep(s.sendConfig.announcementDelay * time.Millisecond)
+func (s *Server) sendRoleChange(receiverRole protobuf.NodeRole, receiverId int) error {
+	roleChangeMsg := &protobuf.GameMessage{
+		MsgSeq:     proto.Int64(s.incrementMsgSeq()),
+		SenderId:   proto.Int32(int32(s.masterId)),
+		ReceiverId: proto.Int32(int32(receiverId)),
+		Type: &protobuf.GameMessage_RoleChange{
+			RoleChange: &protobuf.GameMessage_RoleChangeMsg{
+				SenderRole:   protobuf.NodeRole_MASTER.Enum(),
+				ReceiverRole: receiverRole.Enum(),
+			},
+		},
 	}
-}
-
-func (s *Server) gameLoop() {
-	for {
-		time.Sleep(time.Duration(s.game.Field().DelayMS()) * time.Millisecond)
-
-		s.game.Update()
-
-		s.updatePlayersScore()
-		err := s.sendStateForAll()
-		if err != nil {
-			log.Printf("[Server] Game loop destroyed: %v", err)
-			break
-		}
-	}
+	receiver := s.getAddrById(receiverId)
+	log.Printf("[server] role change receiver: id: %d, addr: %s:%d", receiverId, receiver.IP.String(), receiver.Port)
+	err := s.sendGameMessage(roleChangeMsg, receiver.IP.String(), receiver.Port)
+	return err
 }
 
 func (s *Server) createAnnouncementMessage() *protobuf.GameMessage {
-	var field *game.Field
-	field = s.game.Field()
-
-	serverName := "Snake Game Server"
+	serverName := s.gameName
 
 	announcement := &protobuf.GameMessage{
 		MsgSeq: proto.Int64(s.incrementMsgSeq()),
@@ -235,12 +388,8 @@ func (s *Server) createAnnouncementMessage() *protobuf.GameMessage {
 						Players: &protobuf.GamePlayers{
 							Players: s.getPlayerList(),
 						},
-						Config: &protobuf.GameConfig{
-							Width:        proto.Int32(int32(field.Width())),
-							Height:       proto.Int32(int32(field.Height())),
-							FoodStatic:   proto.Int32(int32(field.FoodStatic())),
-							StateDelayMs: proto.Int32(int32(field.DelayMS())),
-						},
+						Config:   s.game.Field().GameConfig(),
+						CanJoin:  proto.Bool(protobuf.Default_GameAnnouncement_CanJoin),
 						GameName: proto.String(serverName),
 					},
 				},
@@ -251,31 +400,55 @@ func (s *Server) createAnnouncementMessage() *protobuf.GameMessage {
 	return announcement
 }
 
-//TODO
-/*func (s *Server) startResenderThread() {
-	go func() {
-		ticker := time.NewTicker(time.Millisecond * s.sendConfig.pingDelay)
-		defer ticker.Stop()
+func (s *Server) sendStateForAll() error {
+	gameState := s.createGameState()
 
-		for range ticker.C {
-			currentTime := time.Now()
-			for _, player := range s.players {
-				for seq, info := range s.sentMessages {
-					if time.Since(info.Timestamp) > time.Millisecond*800 {
-						info.AttemptCount++
-						if info.AttemptCount > 5 { // 5 попыток
-							log.Printf("[Resender] Player %d does not respond, disconnecting...", info.Message.GetMsgSeq())
-							s.handleDisconnection(player)
-							continue
-						}
-						log.Printf("[Resender] Resending message seq %d to %s", seq, player.String())
-						s.sendGameMessage(info.Message, *player.IpAddress, int(*player.Port))
-					}
-				}
-			}
+	for _, player := range s.players {
+		err := s.sendGameMessage(gameState, *player.IpAddress, int(*player.Port))
+		if err != nil {
+			log.Printf("[server] failed to send game message to player %s:%d: %s", *player.IpAddress, int(*player.Port), err.Error())
+			continue
 		}
-	}()
-}*/
+		log.Printf("[server] send state for player %d", *player.Id)
+	}
+
+	return nil
+}
+
+func (s *Server) createGameState() *protobuf.GameMessage {
+	stateId := s.incrementStateId()
+	field := s.game.Field()
+
+	state := &protobuf.GameState{
+		StateOrder: proto.Int32(int32(stateId)),
+	}
+
+	var snakes []*protobuf.GameState_Snake
+	for _, snake := range field.Snakes() {
+		snakes = append(snakes, game.GenerateSnakeProto(snake, field.Width(), field.Height()))
+	}
+
+	state.Snakes = snakes
+
+	state.Foods = append(state.Foods, s.game.Field().Foods()...)
+
+	players := &protobuf.GamePlayers{
+		Players: s.getPlayerList(),
+	}
+
+	state.Players = players
+
+	stateMsg := &protobuf.GameMessage{
+		MsgSeq: proto.Int64(s.incrementMsgSeq()),
+		Type: &protobuf.GameMessage_State{
+			State: &protobuf.GameMessage_StateMsg{
+				State: state,
+			},
+		},
+	}
+
+	return stateMsg
+}
 
 func (s *Server) sendGameMessage(message *protobuf.GameMessage, address string, port int) error {
 	data, err := proto.Marshal(message)
@@ -296,22 +469,166 @@ func (s *Server) sendGameMessage(message *protobuf.GameMessage, address string, 
 	return nil
 }
 
-func (s *Server) addNewPlayer(playerName string, address string, port int, role *protobuf.NodeRole) {
+func (s *Server) updateDeputyId() {
+	deputyId := 666
+	for _, player := range s.players {
+		if deputyId > int(player.GetId()) && player.GetRole() != protobuf.NodeRole_VIEWER && player.GetRole() != protobuf.NodeRole_MASTER {
+			deputyId = int(player.GetId())
+		}
+	}
+
+	if s.deputyId != deputyId && deputyId != 666 {
+		s.sendRoleChange(protobuf.NodeRole_DEPUTY, deputyId)
+		s.deputyId = deputyId
+		s.changePlayerRole(s.deputyId, protobuf.NodeRole_DEPUTY)
+		log.Printf("[server] new deputy id: %d", deputyId)
+	}
+
+}
+
+func (s *Server) addNewPlayer(playerName string, address string, port int, role *protobuf.NodeRole) int {
+	s.lockServer.Lock()
+	defer s.lockServer.Unlock()
+
+	playerId := s.uniqueId
+	s.uniqueId++
+
 	player := &protobuf.GamePlayer{
 		Name:      proto.String(playerName),
-		Id:        proto.Int32(int32(len(s.players) + 1)),
+		Id:        proto.Int32(int32(playerId)),
 		IpAddress: proto.String(address),
 		Port:      proto.Int32(int32(port)),
 		Role:      role,
-		Type:      protobuf.PlayerType_HUMAN.Enum(),
+		Type:      protobuf.Default_GamePlayer_Type.Enum(),
 		Score:     proto.Int32(0),
 	}
 
 	s.players = append(s.players, player)
+	s.lastPing[playerId] = time.Now()
+	return playerId
+}
+
+func (s *Server) removePlayer(playerId int) {
+	newPlayers := make([]*protobuf.GamePlayer, 0, len(s.players))
+
+	for _, player := range s.players {
+		if player.GetId() != int32(playerId) {
+			newPlayers = append(newPlayers, player)
+		}
+	}
+
+	s.players = newPlayers
+
+	s.game.RemoveSnake(playerId)
+}
+
+func (s *Server) removePlayerWithoutSnake(playerId int) {
+	newPlayers := make([]*protobuf.GamePlayer, 0, len(s.players))
+
+	for _, player := range s.players {
+		if player.GetId() != int32(playerId) {
+			newPlayers = append(newPlayers, player)
+		}
+	}
+
+	if s.deputyId == playerId {
+		s.deputyId = -1
+	}
+
+	s.players = newPlayers
+}
+
+func (s *Server) removeViewer(playerId int) {
+	newPlayers := make([]*protobuf.GamePlayer, 0, len(s.players))
+
+	for _, player := range s.players {
+		if player.GetId() != int32(playerId) {
+			newPlayers = append(newPlayers, player)
+		}
+	}
+
+	s.players = newPlayers
+}
+
+func (s *Server) makePlayerViewer(playerId int) {
+
+	for _, player := range s.players {
+		if player.GetId() != int32(playerId) {
+			player.Role = protobuf.NodeRole_VIEWER.Enum()
+		}
+	}
+
+}
+
+func (s *Server) updatePlayersScore() {
+	for _, player := range s.players {
+		if snake := s.game.Field().SnakeById(int(*player.Id)); snake != nil {
+			s.lockServer.Lock()
+			player.Score = proto.Int32(int32(snake.Score()))
+			s.lockServer.Unlock()
+		}
+	}
+}
+
+func (s *Server) changePlayerRole(playerId int, role protobuf.NodeRole) {
+	for _, player := range s.players {
+		if player.GetId() == int32(playerId) {
+			player.Role = role.Enum()
+		}
+	}
+}
+
+func (s *Server) Stop() error {
+	log.Println("[server] stopping")
+	log.Printf("[server] master id: %d, deputy id: %d", s.masterId, s.deputyId)
+	if len(s.players) != 1 {
+		err := s.sendRoleChange(protobuf.NodeRole_MASTER, s.deputyId)
+		if err != nil {
+			log.Printf("[server] failed to send role change to master: %v", err)
+		}
+	}
+	s.cancel()
+	return s.serverConn.Close()
+}
+
+func (s *Server) GameName() string {
+	return s.gameName
+}
+
+func (s *Server) ServerAddr() *net.UDPAddr {
+	return s.serverAddr
+}
+
+func (s *Server) GameConfig() *protobuf.GameConfig {
+	return s.game.Field().GameConfig()
+}
+
+func (s *Server) Game() *game.Game {
+	return s.game
 }
 
 func (s *Server) getPlayerList() []*protobuf.GamePlayer {
 	return s.players
+}
+
+func (s *Server) getIdByAddr(addr *net.UDPAddr) int {
+	var playerId int
+	for _, player := range s.players {
+		if *player.IpAddress == addr.IP.String() && *player.Port == int32(addr.Port) {
+			playerId = int(*player.Id)
+			return playerId
+		}
+	}
+	return -1
+}
+
+func (s *Server) getAddrById(playerId int) *net.UDPAddr {
+	for _, player := range s.players {
+		if int(player.GetId()) == playerId {
+			return &net.UDPAddr{IP: net.ParseIP(player.GetIpAddress()), Port: int(player.GetPort())}
+		}
+	}
+	return nil
 }
 
 func (s *Server) incrementMsgSeq() int64 {
@@ -319,8 +636,7 @@ func (s *Server) incrementMsgSeq() int64 {
 	return s.msgSeq
 }
 
-func (s *Server) updatePlayersScore() {}
-
-func (s *Server) sendStateForAll() error {
-	return nil
+func (s *Server) incrementStateId() int {
+	s.stateId++
+	return s.stateId
 }

@@ -17,7 +17,7 @@ type Snake struct {
 	color         string
 	playerID      int
 	score         int
-	lock          sync.Mutex
+	lock          *sync.Mutex
 }
 
 func NewSnake(initialPosition []*protobuf.GameState_Coord, playerID int) *Snake {
@@ -30,103 +30,119 @@ func NewSnake(initialPosition []*protobuf.GameState_Coord, playerID int) *Snake 
 		color:         randomColor,
 		playerID:      playerID,
 		score:         0,
+		lock:          new(sync.Mutex),
 	}
 }
 
-func ParseSnake(protoSnake *protobuf.GameState_Snake, height, width int) *Snake {
-	var bodySnake []*protobuf.GameState_Coord
-	head := protoSnake.GetPoints()[0]
+func ParseSnake(snake *protobuf.GameState_Snake, width, height int) *Snake {
+	bodySnake := make([]*protobuf.GameState_Coord, 0)
+	head := snake.GetPoints()[0]
 	bodySnake = append(bodySnake, head)
 
 	x, y := int(head.GetX()), int(head.GetY())
 
-	for _, offset := range protoSnake.GetPoints()[1:] {
-		for j := 0; j < abs(int(offset.GetX())); j++ {
-			x += sign(int(offset.GetX()))
-			if x < 0 {
-				x += width
-			} else if x >= width {
-				x -= width
-			}
+	for i := 1; i < len(snake.GetPoints()); i++ {
+		offset := snake.GetPoints()[i]
+		offsetX, offsetY := int(offset.GetX()), int(offset.GetY())
+
+		for j := 0; j < abs(offsetX); j++ {
+			x += sign(offsetX)
+			x = (x + width) % width
 			bodySnake = append(bodySnake, &protobuf.GameState_Coord{X: proto.Int32(int32(x)), Y: proto.Int32(int32(y))})
 		}
 
-		for j := 0; j < abs(int(offset.GetY())); j++ {
-			y += sign(int(offset.GetY()))
-			if y < 0 {
-				y += height
-			} else if y >= height {
-				y -= height
-			}
+		for j := 0; j < abs(offsetY); j++ {
+			y += sign(offsetY)
+			y = (y + height) % height
 			bodySnake = append(bodySnake, &protobuf.GameState_Coord{X: proto.Int32(int32(x)), Y: proto.Int32(int32(y))})
 		}
 	}
 
-	return NewSnake(bodySnake, int(protoSnake.GetPlayerId()))
+	newSnake := NewSnake(bodySnake, int(*snake.PlayerId))
+	newSnake.SetHeadDirection(snake.GetHeadDirection())
+	newSnake.SetNextDirection(snake.GetHeadDirection())
+	return newSnake
 }
 
-func GenerateSnakeProto(snake *Snake, height, width int) *protobuf.GameState_Snake {
-	snake.lock.Lock()
-	defer snake.lock.Unlock()
-
-	snakeBuilder := &protobuf.GameState_Snake{
-		PlayerId:      proto.Int32(int32(snake.playerID)),
-		HeadDirection: &snake.headDirection,
-		State:         &snake.state,
+func GenerateSnakeProto(snake *Snake, width, height int) *protobuf.GameState_Snake {
+	if len(snake.Body()) == 0 {
+		return nil
 	}
 
-	if len(snake.body) > 0 {
-		head := snake.body[0]
-		snakeBuilder.Points = append(snakeBuilder.Points, head)
-
-		prevX, prevY := int(head.GetX()), int(head.GetY())
-		cumulativeX, cumulativeY := 0, 0
-
-		for _, coord := range snake.body[1:] {
-			currentX, currentY := int(coord.GetX()), int(coord.GetY())
-			deltaX, deltaY := calculateDelta(prevX, currentX, width), calculateDelta(prevY, currentY, height)
-
-			if (deltaX != 0 && cumulativeY != 0) || (deltaY != 0 && cumulativeX != 0) {
-				snakeBuilder.Points = append(snakeBuilder.Points, &protobuf.GameState_Coord{
-					X: proto.Int32(int32(cumulativeX)),
-					Y: proto.Int32(int32(cumulativeY)),
-				})
-				cumulativeX, cumulativeY = 0, 0
-			}
-
-			cumulativeX += deltaX
-			cumulativeY += deltaY
-			prevX, prevY = currentX, currentY
-		}
-
-		if cumulativeX != 0 || cumulativeY != 0 {
-			snakeBuilder.Points = append(snakeBuilder.Points, &protobuf.GameState_Coord{
-				X: proto.Int32(int32(cumulativeX)),
-				Y: proto.Int32(int32(cumulativeY)),
-			})
-		}
+	head := snake.Body()[0]
+	protoSnake := &protobuf.GameState_Snake{
+		PlayerId:      proto.Int32(int32(snake.PlayerID())),
+		Points:        []*protobuf.GameState_Coord{{X: proto.Int32(head.GetX()), Y: proto.Int32(head.GetY())}},
+		State:         protobuf.GameState_Snake_ALIVE.Enum(),
+		HeadDirection: snake.HeadDirection().Enum(),
 	}
 
-	return snakeBuilder
+	for i := 1; i < len(snake.Body()); i++ {
+		current := snake.Body()[i]
+		previous := snake.Body()[i-1]
+
+		dx := current.GetX() - previous.GetX()
+		dy := current.GetY() - previous.GetY()
+
+		if int(dx) == -(width - 1) {
+			dx = 1
+		} else if int(dx) == (width - 1) {
+			dx = -1
+		}
+
+		if int(dy) == -(height - 1) {
+			dy = 1
+		} else if int(dy) == (height - 1) {
+			dy = -1
+		}
+
+		protoSnake.Points = append(protoSnake.Points, &protobuf.GameState_Coord{X: proto.Int32(dx), Y: proto.Int32(dy)})
+	}
+
+	return protoSnake
 }
 
-func (s *Snake) Move(field *Field) bool {
+func (s *Snake) Move(gameField *Field) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	head := s.body[0]
-	dx, dy := 0, 0
+	if len(s.body) == 0 {
+		return false
+	}
 
+	head := s.body[0]
+	var dx, dy int
+
+	lastDirection := s.headDirection
 	for len(s.nextDirection) > 0 {
 		dir := s.nextDirection[0]
 		s.nextDirection = s.nextDirection[1:]
-		if dir == s.headDirection {
+
+		if dir == lastDirection {
 			continue
 		}
-		if isValidDirectionChange(s.headDirection, dir) {
-			s.headDirection = dir
+
+		switch dir {
+		case protobuf.Direction_LEFT:
+			if lastDirection != protobuf.Direction_RIGHT {
+				lastDirection = protobuf.Direction_LEFT
+			}
+		case protobuf.Direction_RIGHT:
+			if lastDirection != protobuf.Direction_LEFT {
+				lastDirection = protobuf.Direction_RIGHT
+			}
+		case protobuf.Direction_UP:
+			if lastDirection != protobuf.Direction_DOWN {
+				lastDirection = protobuf.Direction_UP
+			}
+		case protobuf.Direction_DOWN:
+			if lastDirection != protobuf.Direction_UP {
+				lastDirection = protobuf.Direction_DOWN
+			}
 		}
 	}
+
+	s.headDirection = lastDirection
 
 	switch s.headDirection {
 	case protobuf.Direction_UP:
@@ -140,17 +156,18 @@ func (s *Snake) Move(field *Field) bool {
 	}
 
 	newHead := &protobuf.GameState_Coord{
-		X: proto.Int32((head.GetX() + int32(dx) + int32(field.Width())) % int32(field.Width())),
-		Y: proto.Int32((head.GetY() + int32(dy) + int32(field.Height())) % int32(field.Height())),
+		X: proto.Int32((int32(gameField.Width()) + head.GetX() + int32(dx)) % int32(gameField.Width())),
+		Y: proto.Int32((int32(gameField.Height()) + head.GetY() + int32(dy)) % int32(gameField.Height())),
 	}
 
-	for _, coord := range s.body {
-		if coord.GetX() == newHead.GetX() && coord.GetY() == newHead.GetY() {
+	for _, segment := range s.body {
+		if segment.GetX() == newHead.GetX() && segment.GetY() == newHead.GetY() {
 			return false
 		}
 	}
 
 	s.body = append([]*protobuf.GameState_Coord{newHead}, s.body...)
+
 	return true
 }
 
@@ -177,26 +194,9 @@ func abs(value int) int {
 	return value
 }
 
-func calculateDelta(prev, current, size int) int {
-	delta := current - prev
-	if abs(delta) > size/2 {
-		if delta > 0 {
-			delta -= size
-		} else {
-			delta += size
-		}
-	}
-	return delta
-}
-
-func isValidDirectionChange(current, next protobuf.Direction) bool {
-	return !(current == protobuf.Direction_LEFT && next == protobuf.Direction_RIGHT) &&
-		!(current == protobuf.Direction_RIGHT && next == protobuf.Direction_LEFT) &&
-		!(current == protobuf.Direction_UP && next == protobuf.Direction_DOWN) &&
-		!(current == protobuf.Direction_DOWN && next == protobuf.Direction_UP)
-}
-
 func (s *Snake) Shrink() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 	if len(s.body) > 1 {
 		s.body = s.body[:len(s.body)-1]
 	}
@@ -232,33 +232,67 @@ func (s *Snake) ClearUpdated() {
 	s.updated = false
 }
 
-func (s *Snake) Head() *protobuf.GameState_Coord {
-	return s.body[0]
-}
-
-func (s *Snake) Body() []*protobuf.GameState_Coord {
-	return s.body
+func (s *Snake) SetScore(score int) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.score = score
 }
 
 func (s *Snake) BodyContains(cell *protobuf.GameState_Coord) bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 	for _, part := range s.body {
-		if part.X == cell.X && part.Y == cell.Y {
+		if part.GetX() == cell.GetX() && part.GetY() == cell.GetY() {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *Snake) HeadDirection() protobuf.Direction {
-	return s.headDirection
-}
-
-func (s *Snake) PlayerID() int {
-	return s.playerID
-}
-
 func (s *Snake) IsUpdated() bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	return s.updated
+}
+
+func (s *Snake) Head() *protobuf.GameState_Coord {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.body[0]
+}
+
+func (s *Snake) Body() []*protobuf.GameState_Coord {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.body
+}
+
+func (s *Snake) HeadDirection() protobuf.Direction {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.headDirection
+}
+
+func (s *Snake) PlayerID() int {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.playerID
+}
+
+func (s *Snake) Score() int {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.score
+}
+
+func (s *Snake) Color() string { return s.color }
+
+func (s *Snake) State() protobuf.GameState_Snake_SnakeState {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.state
+}
+
+func (s *Snake) Lock() *sync.Mutex {
+	return s.lock
 }
